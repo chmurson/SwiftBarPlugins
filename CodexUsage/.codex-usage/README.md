@@ -4,12 +4,12 @@ SwiftBar plugin that shows Codex usage/rate-limit remaining percentages in the m
 
 ## Files
 
-- `codex-usage.1m.sh` - SwiftBar executable plugin wrapper.
-- `.codex-usage/codex-usage.js` - dependency-free Node.js fetcher, normalizer, cache, and menu renderer.
+- `CodexUsage/codex-usage.1m.sh` - SwiftBar executable plugin wrapper.
+- `CodexUsage/.codex-usage/codex-usage.js` - dependency-free Node.js fetcher, normalizer, cache, and menu renderer.
 
 ## Install
 
-Use this directory as your SwiftBar plugin folder, or copy both files into:
+Use `CodexUsage` as your SwiftBar plugin folder, or copy both files into:
 
 ```sh
 ~/Library/Application\ Support/SwiftBar/Plugins/
@@ -19,7 +19,7 @@ Only the wrapper should be executable:
 
 ```sh
 chmod +x codex-usage.1m.sh
-chmod -x .codex-usage/codex-usage.js README.md
+chmod -x .codex-usage/codex-usage.js .codex-usage/README.md
 ```
 
 SwiftBar refreshes this plugin every minute because the filename contains `.1m.`.
@@ -37,8 +37,6 @@ Environment variables:
 - `CODEX_USAGE_ENDPOINT=https://chatgpt.com/backend-api/codex/usage`
 - `CODEX_USAGE_CACHE_TTL_SECONDS=90`
 - `CODEX_USAGE_CACHE_FILE=~/.cache/codex-usage-bar/usage.json`
-- `CODEX_USAGE_TITLE_MODE=svg` for a two-line SVG title (default)
-- `CODEX_USAGE_TITLE_MODE=text` for the plain one-line title fallback
 - `CODEX_USAGE_TITLE_LABEL=CODEX` for the vertical SVG label
 
 Auth discovery order:
