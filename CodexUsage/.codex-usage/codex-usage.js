@@ -9,6 +9,8 @@ const VERSION = "0.1.0";
 const DEFAULT_ENDPOINT = "https://chatgpt.com/backend-api/codex/usage";
 const DEFAULT_CACHE_TTL_SECONDS = 90;
 const DEFAULT_TIMEOUT_MS = 12000;
+const DEFAULT_ZERO_LIMIT_TITLE_MODE = "reset";
+const ZERO_LIMIT_TITLE_MODES = new Set(["reset", "tokens"]);
 
 function envInt(name, fallback) {
 	const raw = process.env[name];
@@ -17,18 +19,21 @@ function envInt(name, fallback) {
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+const defaultCacheDir = path.join(
+	process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"),
+	"codex-usage-bar",
+);
+const defaultCacheFile = path.join(defaultCacheDir, "usage.json");
+
 const config = {
 	source: process.env.CODEX_USAGE_SOURCE || "auth-json",
 	endpoint: process.env.CODEX_USAGE_ENDPOINT || DEFAULT_ENDPOINT,
 	authFile: process.env.CODEX_AUTH_FILE || "",
 	titleLabel: process.env.CODEX_USAGE_TITLE_LABEL || "CODEX",
-	cacheFile:
-		process.env.CODEX_USAGE_CACHE_FILE ||
-		path.join(
-			process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"),
-			"codex-usage-bar",
-			"usage.json",
-		),
+	cacheFile: process.env.CODEX_USAGE_CACHE_FILE || defaultCacheFile,
+	titleModeFile:
+		process.env.CODEX_USAGE_TITLE_MODE_FILE ||
+		path.join(defaultCacheDir, "title-mode.json"),
 	cacheTtlSeconds: envInt(
 		"CODEX_USAGE_CACHE_TTL_SECONDS",
 		DEFAULT_CACHE_TTL_SECONDS,
@@ -100,6 +105,42 @@ function resetText(epochSeconds) {
 	return `resets in ${minutes}m`;
 }
 
+function startOfDay(date) {
+	return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function dayDelta(fromDate, toDate) {
+	const from = startOfDay(fromDate).getTime();
+	const to = startOfDay(toDate).getTime();
+	return Math.round((to - from) / 86400000);
+}
+
+function weekdayText(date) {
+	return new Intl.DateTimeFormat(undefined, { weekday: "short" })
+		.format(date)
+		.replace(/\.$/, "");
+}
+
+function resetExactText(epochSeconds, { compact = false } = {}) {
+	if (!epochSeconds) return "";
+	const resetMs = Number(epochSeconds) * 1000;
+	if (!Number.isFinite(resetMs)) return "";
+	const date = new Date(resetMs);
+	const time = formatClock(date.toISOString());
+	const delta = dayDelta(new Date(), date);
+	if (delta === 0) return compact ? time : `Today ${time}`;
+	if (delta === 1) return `${compact ? "Tom" : "Tomorrow"} ${time}`;
+	return `${weekdayText(date)} ${time}`;
+}
+
+function resetSummaryText(epochSeconds) {
+	const relative = resetText(epochSeconds);
+	const exact = resetExactText(epochSeconds);
+	if (!relative) return exact;
+	if (!exact) return relative;
+	return `${relative}, ${exact}`;
+}
+
 const USAGE_COLOR = {
 	burntOrange: "#F56527",
 	amber: "#F5B427",
@@ -141,6 +182,32 @@ function writeJson(filePath, data) {
 	fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, {
 		mode: 0o600,
 	});
+}
+
+function normalizeZeroLimitTitleMode(mode) {
+	return ZERO_LIMIT_TITLE_MODES.has(mode) ? mode : DEFAULT_ZERO_LIMIT_TITLE_MODE;
+}
+
+function readZeroLimitTitleMode() {
+	try {
+		return normalizeZeroLimitTitleMode(readJson(config.titleModeFile).mode);
+	} catch {
+		return DEFAULT_ZERO_LIMIT_TITLE_MODE;
+	}
+}
+
+function writeZeroLimitTitleMode(mode) {
+	writeJson(config.titleModeFile, {
+		mode: normalizeZeroLimitTitleMode(mode),
+		updatedAt: nowIso(),
+	});
+}
+
+function toggleZeroLimitTitleMode() {
+	const current = readZeroLimitTitleMode();
+	const next = current === "reset" ? "tokens" : "reset";
+	writeZeroLimitTitleMode(next);
+	return next;
 }
 
 function readCache() {
@@ -502,6 +569,10 @@ function swiftbarEscape(value) {
 	return String(value).replace(/\s+/g, " ").replace(/\|/g, "/").slice(0, 240);
 }
 
+function swiftbarAttr(value) {
+	return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\|/g, "/")}"`;
+}
+
 function xmlEscape(value) {
 	return String(value)
 		.replace(/&/g, "&amp;")
@@ -514,44 +585,104 @@ function svgData(svg) {
 	return Buffer.from(svg, "utf8").toString("base64");
 }
 
-function usageTitleSvg(five, week, fiveColor, weekColor, stale) {
+function zeroLimitTitleLines(usage, titleMode) {
+	const candidates = [
+		{
+			label: "5h",
+			value: usage.fiveHourRemainingPct,
+			resetsAt: usage.primaryResetsAt,
+		},
+		{
+			label: "1w",
+			value: usage.weeklyRemainingPct,
+			resetsAt: usage.secondaryResetsAt,
+		},
+	].filter((entry) => entry.value === 0);
+
+	if (candidates.length === 0) return null;
+	candidates.sort((a, b) => {
+		const aReset = Number(a.resetsAt) || Number.POSITIVE_INFINITY;
+		const bReset = Number(b.resetsAt) || Number.POSITIVE_INFINITY;
+		return aReset - bReset;
+	});
+
+	const zero = candidates[0];
+	return {
+		line1: `${zero.label}  0%`,
+		line2:
+			titleMode === "tokens"
+				? `${numberText(usage.additionalTokens)} tok`
+				: resetExactText(zero.resetsAt, { compact: true }) || "reset ?",
+		lineColor1: colorForPct(0),
+		lineColor2: USAGE_COLOR.softWhite,
+	};
+}
+
+function usageTitleSvg(usage, stale, titleMode) {
+	const five = usage.fiveHourRemainingPct;
+	const week = usage.weeklyRemainingPct;
 	const label = config.titleLabel.slice(0, 5).toUpperCase();
-	const line1 = `5h  ${pctText(five)}`;
-	const line2 = `1w  ${pctText(week)}`;
+	const titleLines = zeroLimitTitleLines(usage, titleMode) || {
+		line1: `5h  ${pctText(five)}`,
+		line2: `1w  ${pctText(week)}`,
+		lineColor1: colorForPct(five),
+		lineColor2: colorForPct(week),
+	};
 	const accentColor = stale ? USAGE_COLOR.staleGray : USAGE_COLOR.softWhite;
-	const lineColor1 = stale ? USAGE_COLOR.staleGray : fiveColor;
-	const lineColor2 = stale ? USAGE_COLOR.staleGray : weekColor;
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="56" height="24" viewBox="0 0 56 24">
+	const lineColor1 = stale ? USAGE_COLOR.staleGray : titleLines.lineColor1;
+	const lineColor2 = stale ? USAGE_COLOR.staleGray : titleLines.lineColor2;
+	const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="62" height="24" viewBox="0 0 62 24">
 		<style>
 		text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Helvetica, Arial, sans-serif; font-weight: 600; }
 		</style>
 		<text x="-22" y="8" transform="rotate(-90)" font-size="6" letter-spacing="0.4" fill="${xmlEscape(accentColor)}">${xmlEscape(label)}</text>
 		<line x1="10" y1="2" x2="10" y2="22" stroke="${xmlEscape(accentColor)}" stroke-opacity="0.35" stroke-width="1"/>
-		<text x="14" y="9" font-size="10" fill="${xmlEscape(lineColor1)}">${xmlEscape(line1)}</text>
-		<text x="14" y="21" font-size="10" fill="${xmlEscape(lineColor2)}">${xmlEscape(line2)}</text>
+		<text x="14" y="9" font-size="10" fill="${xmlEscape(lineColor1)}">${xmlEscape(titleLines.line1)}</text>
+		<text x="14" y="21" font-size="10" fill="${xmlEscape(lineColor2)}">${xmlEscape(titleLines.line2)}</text>
 		</svg>`;
 	return svgData(svg);
 }
 
-function printTitle(five, week, stale) {
+function printTitle(usage, stale, titleMode) {
+	const five = usage.fiveHourRemainingPct;
+	const week = usage.weeklyRemainingPct;
 	const titleColor = titleColorFor(five, week, stale);
 	console.log(
-		`| image=${usageTitleSvg(five, week, colorForPct(five), colorForPct(week), stale)} color=${titleColor}`,
+		`| image=${usageTitleSvg(usage, stale, titleMode)} color=${titleColor}`,
+	);
+}
+
+function titleModeLabel(mode) {
+	return mode === "tokens" ? "additional tokens left" : "reset time";
+}
+
+function titleModeToggleLabel(mode) {
+	const next = mode === "tokens" ? "reset time" : "additional tokens left";
+	return `Switch zero-limit title to: ${next}`;
+}
+
+function commandScriptPath() {
+	if (process.env.CODEX_USAGE_PLUGIN_WRAPPER)
+		return process.env.CODEX_USAGE_PLUGIN_WRAPPER;
+	return path.join(
+		path.dirname(path.dirname(process.argv[1] || "")),
+		"codex-usage.1m.sh",
 	);
 }
 
 function printMenu(usage, options = {}) {
+	const titleMode = readZeroLimitTitleMode();
 	const five = usage.fiveHourRemainingPct;
 	const week = usage.weeklyRemainingPct;
-	printTitle(five, week, options.stale);
+	printTitle(usage, options.stale, titleMode);
 	console.log("---");
 	console.log("Codex usage | size=13");
 	console.log("---");
 	console.log(
-		`5h window: ${pctText(five)} left${usage.primaryResetsAt ? `, ${resetText(usage.primaryResetsAt)}` : ""}`,
+		`5h window: ${pctText(five)} left${usage.primaryResetsAt ? `, ${resetSummaryText(usage.primaryResetsAt)}` : ""}`,
 	);
 	console.log(
-		`Weekly: ${pctText(week)} left${usage.secondaryResetsAt ? `, ${resetText(usage.secondaryResetsAt)}` : ""}`,
+		`Weekly: ${pctText(week)} left${usage.secondaryResetsAt ? `, ${resetSummaryText(usage.secondaryResetsAt)}` : ""}`,
 	);
 	console.log(`Additional tokens: ${numberText(usage.additionalTokens)}`);
 	if (usage.plan) console.log(`Plan: ${swiftbarEscape(usage.plan)}`);
@@ -561,6 +692,13 @@ function printMenu(usage, options = {}) {
 	console.log(`Last updated: ${formatClock(usage.fetchedAt)}`);
 	if (options.error)
 		console.log(`Last error: ${swiftbarEscape(options.error)} | color=red`);
+	console.log("---");
+	console.log(
+		`Zero-limit title shows: ${titleModeLabel(titleMode)} | color=gray`,
+	);
+	console.log(
+		`${titleModeToggleLabel(titleMode)} | bash=${swiftbarAttr(commandScriptPath())} param1=toggle-zero-title-mode terminal=false refresh=true`,
+	);
 	console.log("---");
 	console.log(
 		"Open usage page | href=https://chatgpt.com/codex/settings/usage",
@@ -599,6 +737,11 @@ function printError(message, cached) {
 }
 
 async function main() {
+	if (process.argv[2] === "toggle-zero-title-mode") {
+		toggleZeroLimitTitleMode();
+		return;
+	}
+
 	const cached = readCache();
 	if (isFresh(cached)) {
 		printMenu(cached);

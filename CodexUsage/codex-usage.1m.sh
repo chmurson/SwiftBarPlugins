@@ -10,9 +10,10 @@ for NODE in \
   /usr/local/bin/node
 do
   if [[ -n "$NODE" && -x "$NODE" ]] && "$NODE" --version >/dev/null 2>&1; then
+    export CODEX_USAGE_PLUGIN_WRAPPER="$0"
     export CODEX_USAGE_NODE="$NODE"
     export CODEX_USAGE_NODE_VERSION="$("$NODE" --version 2>/dev/null)"
-    exec "$NODE" "$SCRIPT"
+    exec "$NODE" "$SCRIPT" "$@"
   fi
 done
 
