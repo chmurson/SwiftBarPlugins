@@ -73,6 +73,15 @@ function pctText(value) {
 	return value === null || value === undefined ? "?" : `${value}%`;
 }
 
+function numberText(value) {
+	if (value === null || value === undefined) return "?";
+	const number = Number(value);
+	if (!Number.isFinite(number)) return "?";
+	return new Intl.NumberFormat(undefined, {
+		maximumFractionDigits: 0,
+	}).format(number);
+}
+
 function resetText(epochSeconds) {
 	if (!epochSeconds) return "";
 	const resetMs = Number(epochSeconds) * 1000;
@@ -178,6 +187,24 @@ function pickString(obj, paths) {
 		if (typeof cursor === "string" && cursor.trim()) return cursor.trim();
 	}
 	return "";
+}
+
+function pickNumber(obj, paths) {
+	for (const parts of paths) {
+		let cursor = obj;
+		for (const part of parts) {
+			if (cursor === null || typeof cursor !== "object" || !(part in cursor)) {
+				cursor = undefined;
+				break;
+			}
+			cursor = cursor[part];
+		}
+		if (cursor !== null && cursor !== undefined && cursor !== "") {
+			const number = Number(cursor);
+			if (Number.isFinite(number)) return number;
+		}
+	}
+	return null;
 }
 
 function extractTokens(auth) {
@@ -311,6 +338,15 @@ function normalizeUsage(raw) {
 	const secondaryUsed =
 		secondary &&
 		(secondary.usedPercent ?? secondary.used_percent ?? secondary.percent_used);
+	const additionalTokens = pickNumber(raw, [
+		["credits", "balance"],
+		["additional_tokens"],
+		["additionalTokens"],
+		["additional_rate_limits", "tokens"],
+		["additional_rate_limits", "token_balance"],
+		["additional_rate_limits", "remaining_tokens"],
+		["additional_rate_limits", "remainingTokens"],
+	]);
 
 	const fiveHourRemainingPct =
 		primary &&
@@ -352,6 +388,7 @@ function normalizeUsage(raw) {
 		model: raw.model || raw.current_model || raw.defaultModel || null,
 		fiveHourRemainingPct,
 		weeklyRemainingPct,
+		additionalTokens,
 		primaryWindowMins:
 			primary &&
 			(primary.windowDurationMins ??
@@ -516,6 +553,7 @@ function printMenu(usage, options = {}) {
 	console.log(
 		`Weekly: ${pctText(week)} left${usage.secondaryResetsAt ? `, ${resetText(usage.secondaryResetsAt)}` : ""}`,
 	);
+	console.log(`Additional tokens: ${numberText(usage.additionalTokens)}`);
 	if (usage.plan) console.log(`Plan: ${swiftbarEscape(usage.plan)}`);
 	if (usage.model) console.log(`Model: ${swiftbarEscape(usage.model)}`);
 	if (usage.reached)
