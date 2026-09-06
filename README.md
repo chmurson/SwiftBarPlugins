@@ -6,6 +6,7 @@ Personal SwiftBar plugins.
 
 - `CodexUsage` - shows Codex usage/rate-limit remaining percentages in the macOS menu bar.
 - `ClaudeUsage` - displays current Claude API usage spending in dollars in the macOS menu bar.
+- `SleepControl` - shows whether macOS system sleep is allowed and toggles the `disablesleep` setting.
 
 ## Installation
 
@@ -34,6 +35,7 @@ Personal SwiftBar plugins.
    ```bash
    ln -s ~/Dev/SwiftBarPlugins/CodexUsage/codex-usage.1m.sh ~/Library/Application\ Support/SwiftBar/Plugins/
    ln -s ~/Dev/SwiftBarPlugins/ClaudeUsage/claude-usage.1m.sh ~/Library/Application\ Support/SwiftBar/Plugins/
+   ln -s ~/Dev/SwiftBarPlugins/SleepControl/sleep-control.10s.sh ~/Library/Application\ Support/SwiftBar/Plugins/
    ```
 
 4. **SwiftBar will automatically load** the plugin and it should appear in your menu bar

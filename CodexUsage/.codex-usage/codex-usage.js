@@ -1,760 +1,284 @@
 #!/usr/bin/env node
+"use strict";
 
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const { spawnSync } = require("child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { createHash, randomUUID } = require("node:crypto");
+const { AppServer } = require("./app-server");
+const { number, normalizeUsage, normalizeActivity, selectBucket } = require("./usage");
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
+const CACHE_VERSION = 2;
+const USAGE_URL = "https://chatgpt.com/codex/settings/usage";
 const DEFAULT_ENDPOINT = "https://chatgpt.com/backend-api/codex/usage";
-const DEFAULT_CACHE_TTL_SECONDS = 90;
-const DEFAULT_TIMEOUT_MS = 12000;
-const DEFAULT_ZERO_LIMIT_TITLE_MODE = "reset";
-const ZERO_LIMIT_TITLE_MODES = new Set(["reset", "tokens"]);
+const COLORS = { critical: "#F56527", low: "#F5B427", watch: "#F5DA27", healthy: "#98F527", stale: "#9CA3AF", unknown: "gray" };
+const LIGHT_NEUTRAL = "#111111";
+const LIGHT_COLORS = { "#F56527": "#B84314", "#F5B427": "#925F00", "#F5DA27": "#836900", "#98F527": "#367C0A" };
 
-function envInt(name, fallback) {
-	const raw = process.env[name];
-	if (!raw) return fallback;
-	const parsed = Number.parseInt(raw, 10);
-	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+function expandHome(value) {
+  return value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
 }
 
-const defaultCacheDir = path.join(
-	process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"),
-	"codex-usage-bar",
-);
-const defaultCacheFile = path.join(defaultCacheDir, "usage.json");
-
-const config = {
-	source: process.env.CODEX_USAGE_SOURCE || "auth-json",
-	endpoint: process.env.CODEX_USAGE_ENDPOINT || DEFAULT_ENDPOINT,
-	authFile: process.env.CODEX_AUTH_FILE || "",
-	titleLabel: process.env.CODEX_USAGE_TITLE_LABEL || "CODEX",
-	cacheFile: process.env.CODEX_USAGE_CACHE_FILE || defaultCacheFile,
-	titleModeFile:
-		process.env.CODEX_USAGE_TITLE_MODE_FILE ||
-		path.join(defaultCacheDir, "title-mode.json"),
-	cacheTtlSeconds: envInt(
-		"CODEX_USAGE_CACHE_TTL_SECONDS",
-		DEFAULT_CACHE_TTL_SECONDS,
-	),
-	timeoutMs: envInt("CODEX_USAGE_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
-};
-
-function nowIso() {
-	return new Date().toISOString();
+function configFromEnv(env = process.env) {
+  const cacheDir = path.join(expandHome(env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache")), "codex-usage-bar");
+  const integer = (key, fallback, minimum = 0) => {
+    const parsed = number(env[key]);
+    return parsed !== null && Number.isInteger(parsed) && parsed >= minimum ? parsed : fallback;
+  };
+  const codexHome = expandHome(env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  return {
+    source: env.CODEX_USAGE_SOURCE || (env.CODEX_AUTH_FILE || env.CODEX_USAGE_ENDPOINT ? "auth-json" : "auto"),
+    endpoint: env.CODEX_USAGE_ENDPOINT || DEFAULT_ENDPOINT,
+    codexCommand: expandHome(env.CODEX_USAGE_CODEX || env.CODEX_CLI_COMMAND || "codex"),
+    codexHome,
+    authFile: expandHome(env.CODEX_AUTH_FILE || path.join(codexHome, "auth.json")),
+    cacheFile: expandHome(env.CODEX_USAGE_CACHE_FILE || path.join(cacheDir, "usage.json")),
+    titleModeFile: expandHome(env.CODEX_USAGE_TITLE_MODE_FILE || path.join(cacheDir, "title-mode.json")),
+    cacheTtlSeconds: integer("CODEX_USAGE_CACHE_TTL_SECONDS", 90),
+    timeoutMs: integer("CODEX_USAGE_TIMEOUT_MS", 12000, 1),
+    titleLabel: env.CODEX_USAGE_TITLE_LABEL || "CODEX",
+    bucketId: env.CODEX_USAGE_LIMIT_ID || "codex",
+    showActivity: env.CODEX_USAGE_SHOW_ACTIVITY === "1",
+    light: env.OS_APPEARANCE === "Light",
+    wrapper: env.CODEX_USAGE_PLUGIN_WRAPPER || path.join(__dirname, "..", "codex-usage.1m.sh"),
+  };
 }
 
-function expandHome(filePath) {
-	if (!filePath) return filePath;
-	if (filePath === "~") return os.homedir();
-	if (filePath.startsWith("~/"))
-		return path.join(os.homedir(), filePath.slice(2));
-	return filePath;
+function readJson(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, file);
+  } finally { try { fs.unlinkSync(temporary); } catch {} }
 }
 
-function formatClock(iso) {
-	if (!iso) return "?";
-	const date = new Date(iso);
-	if (Number.isNaN(date.getTime())) return "?";
-	return new Intl.DateTimeFormat(undefined, {
-		hour: "2-digit",
-		minute: "2-digit",
-		hour12: false,
-	}).format(date);
+function cacheKey(config) {
+  const stamp = file => {
+    try { const stat = fs.statSync(file); return [stat.mtimeMs, stat.size]; } catch { return null; }
+  };
+  // Credentials never enter the cache; invalidate after login/config changes.
+  return createHash("sha256").update(JSON.stringify([
+    config.source, config.endpoint, config.codexCommand, config.codexHome,
+    config.authFile, stamp(config.authFile), stamp(path.join(config.codexHome, "config.toml")), config.showActivity,
+  ])).digest("hex");
 }
 
-function clampPercent(value) {
-	if (!Number.isFinite(value)) return null;
-	return Math.max(0, Math.min(100, Math.round(value)));
+function readCache(config, key) {
+  try {
+    const cached = readJson(config.cacheFile);
+    if (cached.version !== CACHE_VERSION || cached.key !== key) return null;
+    const usage = cached.usage;
+    if (!usage || !Number.isFinite(Date.parse(usage.fetchedAt)) || !Array.isArray(usage.buckets) || !usage.buckets.length) return null;
+    if (!usage.buckets.every(bucket => typeof bucket?.id === "string" && Array.isArray(bucket.windows)
+      && bucket.windows.every(window => window && typeof window.label === "string"
+        && (window.remainingPct === null || (Number.isFinite(window.remainingPct) && window.remainingPct >= 0 && window.remainingPct <= 100))))) return null;
+    return usage;
+  } catch { return null; }
 }
 
-function usedToRemaining(value) {
-	const used = clampPercent(Number(value));
-	return used === null ? null : 100 - used;
+function isFresh(usage, config, force = false, now = Date.now()) {
+  if (!usage || force) return false;
+  const age = now - Date.parse(usage.fetchedAt);
+  if (age < 0 || age >= config.cacheTtlSeconds * 1000) return false;
+  // A passed reset needs a new reading, never a synthesized 100% window.
+  return !usage.buckets.some(bucket => bucket.windows.some(window => window.resetsAt && window.resetsAt * 1000 <= now));
 }
 
-function pctText(value) {
-	return value === null || value === undefined ? "?" : `${value}%`;
-}
-
-function numberText(value) {
-	if (value === null || value === undefined) return "?";
-	const number = Number(value);
-	if (!Number.isFinite(number)) return "?";
-	return new Intl.NumberFormat(undefined, {
-		maximumFractionDigits: 0,
-	}).format(number);
-}
-
-function resetText(epochSeconds) {
-	if (!epochSeconds) return "";
-	const resetMs = Number(epochSeconds) * 1000;
-	if (!Number.isFinite(resetMs)) return "";
-	const deltaMs = resetMs - Date.now();
-	if (deltaMs <= 0) return "resets now";
-	const totalMinutes = Math.ceil(deltaMs / 60000);
-	const hours = Math.floor(totalMinutes / 60);
-	const minutes = totalMinutes % 60;
-	if (hours >= 24) {
-		const days = Math.floor(hours / 24);
-		const remHours = hours % 24;
-		return `resets in ${days}d ${remHours}h`;
-	}
-	if (hours > 0) return `resets in ${hours}h ${minutes}m`;
-	return `resets in ${minutes}m`;
-}
-
-function startOfDay(date) {
-	return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
-function dayDelta(fromDate, toDate) {
-	const from = startOfDay(fromDate).getTime();
-	const to = startOfDay(toDate).getTime();
-	return Math.round((to - from) / 86400000);
-}
-
-function weekdayText(date) {
-	return new Intl.DateTimeFormat(undefined, { weekday: "short" })
-		.format(date)
-		.replace(/\.$/, "");
-}
-
-function resetExactText(epochSeconds, { compact = false } = {}) {
-	if (!epochSeconds) return "";
-	const resetMs = Number(epochSeconds) * 1000;
-	if (!Number.isFinite(resetMs)) return "";
-	const date = new Date(resetMs);
-	const time = formatClock(date.toISOString());
-	const delta = dayDelta(new Date(), date);
-	if (delta === 0) return compact ? time : `Today ${time}`;
-	if (delta === 1) return `${compact ? "Tom" : "Tomorrow"} ${time}`;
-	return `${weekdayText(date)} ${time}`;
-}
-
-function resetSummaryText(epochSeconds) {
-	const relative = resetText(epochSeconds);
-	const exact = resetExactText(epochSeconds);
-	if (!relative) return exact;
-	if (!exact) return relative;
-	return `${relative}, ${exact}`;
-}
-
-const USAGE_COLOR = {
-	burntOrange: "#F56527",
-	amber: "#F5B427",
-	warmYellow: "#F5DA27",
-	limeGreen: "#98F527",
-	softWhite: "#E8E8E8",
-	staleGray: "#9CA3AF",
-	unknownGray: "gray",
-};
-
-const USAGE_REMAINING_BANDS = [
-	{ label: "critical", maxPct: 10, color: USAGE_COLOR.burntOrange },
-	{ label: "low", maxPct: 25, color: USAGE_COLOR.amber },
-	{ label: "watch", maxPct: 40, color: USAGE_COLOR.warmYellow },
-	{ label: "healthy", maxPct: 100, color: USAGE_COLOR.limeGreen },
-];
-
-const UNKNOWN_USAGE_COLOR = USAGE_COLOR.unknownGray;
-
-function colorForPct(value) {
-	if (!Number.isFinite(value)) return UNKNOWN_USAGE_COLOR;
-	const band = USAGE_REMAINING_BANDS.find((entry) => value <= entry.maxPct);
-	return band ? band.color : UNKNOWN_USAGE_COLOR;
-}
-
-function titleColorFor(five, week, stale) {
-	if (stale) return USAGE_COLOR.staleGray;
-	const values = [five, week].filter((value) => Number.isFinite(value));
-	if (values.length === 0) return UNKNOWN_USAGE_COLOR;
-	return colorForPct(Math.min(...values));
-}
-
-function readJson(filePath) {
-	return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
-
-function writeJson(filePath, data) {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-	fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, {
-		mode: 0o600,
-	});
-}
-
-function normalizeZeroLimitTitleMode(mode) {
-	return ZERO_LIMIT_TITLE_MODES.has(mode) ? mode : DEFAULT_ZERO_LIMIT_TITLE_MODE;
-}
-
-function readZeroLimitTitleMode() {
-	try {
-		return normalizeZeroLimitTitleMode(readJson(config.titleModeFile).mode);
-	} catch {
-		return DEFAULT_ZERO_LIMIT_TITLE_MODE;
-	}
-}
-
-function writeZeroLimitTitleMode(mode) {
-	writeJson(config.titleModeFile, {
-		mode: normalizeZeroLimitTitleMode(mode),
-		updatedAt: nowIso(),
-	});
-}
-
-function toggleZeroLimitTitleMode() {
-	const current = readZeroLimitTitleMode();
-	const next = current === "reset" ? "tokens" : "reset";
-	writeZeroLimitTitleMode(next);
-	return next;
-}
-
-function readCache() {
-	try {
-		const cache = readJson(config.cacheFile);
-		const fetchedAtMs = new Date(cache.fetchedAt).getTime();
-		if (!Number.isFinite(fetchedAtMs)) return null;
-		return cache;
-	} catch {
-		return null;
-	}
-}
-
-function isFresh(cache) {
-	if (!cache || process.env.SWIFTBAR_REFRESH || process.env.BITBAR_REFRESH)
-		return false;
-	const fetchedAtMs = new Date(cache.fetchedAt).getTime();
-	return Date.now() - fetchedAtMs < config.cacheTtlSeconds * 1000;
-}
-
-function authCandidates() {
-	if (config.authFile) return [expandHome(config.authFile)];
-	const candidates = [];
-	if (process.env.CODEX_HOME)
-		candidates.push(path.join(expandHome(process.env.CODEX_HOME), "auth.json"));
-	candidates.push(path.join(os.homedir(), ".codex", "auth.json"));
-	return [...new Set(candidates)];
-}
-
-function findAuthFile() {
-	return authCandidates().find((candidate) => fs.existsSync(candidate));
-}
-
-function pickString(obj, paths) {
-	for (const parts of paths) {
-		let cursor = obj;
-		for (const part of parts) {
-			if (cursor === null || typeof cursor !== "object" || !(part in cursor)) {
-				cursor = undefined;
-				break;
-			}
-			cursor = cursor[part];
-		}
-		if (typeof cursor === "string" && cursor.trim()) return cursor.trim();
-	}
-	return "";
-}
-
-function pickNumber(obj, paths) {
-	for (const parts of paths) {
-		let cursor = obj;
-		for (const part of parts) {
-			if (cursor === null || typeof cursor !== "object" || !(part in cursor)) {
-				cursor = undefined;
-				break;
-			}
-			cursor = cursor[part];
-		}
-		if (cursor !== null && cursor !== undefined && cursor !== "") {
-			const number = Number(cursor);
-			if (Number.isFinite(number)) return number;
-		}
-	}
-	return null;
+function titleMode(config) {
+  try {
+    const mode = readJson(config.titleModeFile).mode;
+    return mode === "tokens" || mode === "credits" ? "credits" : "reset";
+  } catch { return "reset"; }
 }
 
 function extractTokens(auth) {
-	return {
-		accessToken: pickString(auth, [
-			["access_token"],
-			["accessToken"],
-			["tokens", "access_token"],
-			["tokens", "accessToken"],
-			["oauth", "access_token"],
-			["oauth", "accessToken"],
-			["chatgpt", "access_token"],
-			["chatgpt", "accessToken"],
-		]),
-		refreshToken: pickString(auth, [
-			["refresh_token"],
-			["refreshToken"],
-			["tokens", "refresh_token"],
-			["tokens", "refreshToken"],
-			["oauth", "refresh_token"],
-			["oauth", "refreshToken"],
-			["chatgpt", "refresh_token"],
-			["chatgpt", "refreshToken"],
-		]),
-		accountId: pickString(auth, [
-			["account_id"],
-			["accountId"],
-			["account", "id"],
-			["chatgpt", "account_id"],
-			["chatgpt", "accountId"],
-		]),
-	};
+  const containers = [auth?.tokens, auth, auth?.oauth, auth?.chatgpt];
+  const pick = keys => {
+    for (const container of containers) {
+      for (const key of keys) if (typeof container?.[key] === "string" && container[key].trim()) return container[key].trim();
+    }
+    return "";
+  };
+  return { accessToken: pick(["access_token", "accessToken"]), accountId: pick(["account_id", "accountId"]) || auth?.account?.id || "" };
 }
 
-function decodeJwtPayload(token) {
-	const part = token.split(".")[1];
-	if (!part) return null;
-	try {
-		const padded = part.padEnd(
-			part.length + ((4 - (part.length % 4)) % 4),
-			"=",
-		);
-		return JSON.parse(Buffer.from(padded, "base64url").toString("utf8"));
-	} catch {
-		return null;
-	}
+async function fetchViaAuthJson(config, fetchImpl = fetch) {
+  const endpoint = new URL(config.endpoint);
+  if (endpoint.origin !== "https://chatgpt.com" || endpoint.username || endpoint.password) throw new Error("CODEX_USAGE_ENDPOINT must use https://chatgpt.com to protect Codex credentials");
+  let auth;
+  try { auth = readJson(config.authFile); } catch { throw new Error("Codex auth.json unavailable; run codex login or use the app-server source"); }
+  const { accessToken, accountId } = extractTokens(auth);
+  if (!accessToken) throw new Error("No ChatGPT access token; sign in with codex login");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  try {
+    const headers = { authorization: `Bearer ${accessToken}`, accept: "application/json" };
+    if (accountId) headers["chatgpt-account-id"] = accountId;
+    const response = await fetchImpl(endpoint.href, { method: "GET", headers, redirect: "error", signal: controller.signal });
+    if (!response.ok) {
+      if ([401, 403].includes(response.status)) throw new Error(`HTTP ${response.status}: sign in with codex login or use app-server to refresh authentication`);
+      throw new Error(`Usage request failed (HTTP ${response.status}); try Refresh later`);
+    }
+    return { ...normalizeUsage(await response.json()), source: "auth-json" };
+  } catch (error) {
+    if (/^(HTTP |Usage request failed|Unrecognized usage|Usage response)/.test(error.message)) throw error;
+    throw new Error(controller.signal.aborted ? "Usage request timed out; try Refresh" : "Could not read usage from ChatGPT");
+  } finally { clearTimeout(timer); }
 }
 
-function tokenExpiresSoon(accessToken) {
-	const payload = decodeJwtPayload(accessToken);
-	if (!payload || !payload.exp) return false;
-	return payload.exp * 1000 - Date.now() < 5 * 60 * 1000;
+async function fetchViaAppServer(config) {
+  const client = new AppServer(config.codexCommand, { timeoutMs: config.timeoutMs });
+  try {
+    await client.initialize();
+    const usage = { ...normalizeUsage(await client.request("account/rateLimits/read")), source: "app-server" };
+    if (config.showActivity) {
+      try { usage.activity = normalizeActivity(await client.request("account/usage/read", undefined, Math.min(4000, config.timeoutMs))); }
+      catch { usage.activityUnavailable = true; }
+    }
+    return usage;
+  } finally { client.close(); }
 }
 
-async function requestJson(url, options) {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
-	try {
-		const response = await fetch(url, {
-			...options,
-			signal: controller.signal,
-		});
-		const text = await response.text();
-		let body = null;
-		if (text) {
-			try {
-				body = JSON.parse(text);
-			} catch {
-				body = { message: text.slice(0, 300) };
-			}
-		}
-		if (!response.ok) {
-			const message = body && (body.detail || body.message || body.error);
-			throw new Error(
-				`HTTP ${response.status}${message ? `: ${message}` : ""}`,
-			);
-		}
-		return body;
-	} finally {
-		clearTimeout(timeout);
-	}
+async function fetchFresh(config) {
+  if (config.source === "auth-json") return fetchViaAuthJson(config);
+  if (!["auto", "app-server", "codex-cli"].includes(config.source)) throw new Error("Unsupported CODEX_USAGE_SOURCE; use auto, app-server, or auth-json");
+  try { return await fetchViaAppServer(config); }
+  catch (error) {
+    // Only an absent CLI permits fallback. Auth/server errors must not switch accounts.
+    if (config.source === "auto" && error.code === "ENOENT") return fetchViaAuthJson(config);
+    throw error;
+  }
 }
 
-async function refreshAccessToken(refreshToken) {
-	if (!refreshToken) return "";
-	const refreshEndpoint =
-		process.env.CODEX_REFRESH_ENDPOINT || "https://auth.openai.com/oauth/token";
-	const clientId =
-		process.env.CODEX_OAUTH_CLIENT_ID || "app_EMoamEEZ73f0CkXaXp7hrann";
+function escape(value) { return String(value).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").replace(/\|/g, "/").slice(0, 240); }
+function attr(value) { return `"${escape(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`; }
+function xml(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+function pct(value) {
+  if (!Number.isFinite(value)) return "?";
+  if (value > 0 && value < 1) return "<1%";
+  if (value < 100 && value > 99) return ">99%";
+  return `${Math.round(value)}%`;
+}
+function numberText(value) { return number(value) === null ? "?" : new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(Number(value)); }
+function color(value) {
+  if (!Number.isFinite(value)) return COLORS.unknown;
+  return value <= 10 ? COLORS.critical : value <= 25 ? COLORS.low : value <= 40 ? COLORS.watch : COLORS.healthy;
+}
+function clock(value) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date) : "?";
+}
+function exactReset(seconds, now = Date.now()) {
+  if (!Number.isFinite(seconds) || seconds <= 0 || !Number.isFinite(new Date(seconds * 1000).getTime())) return "reset ?";
+  if (seconds * 1000 <= now) return "reset due";
+  const date = new Date(seconds * 1000);
+  const today = new Date(now);
+  const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+  if (date.toDateString() === today.toDateString()) return clock(date);
+  if (date.toDateString() === tomorrow.toDateString()) return `Tom ${clock(date)}`;
+  return `${new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date).replace(/\.$/, "")} ${clock(date)}`;
+}
+function resetSummary(seconds, now = Date.now()) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "reset time unavailable";
+  if (seconds * 1000 <= now) return "reset due; awaiting updated usage";
+  const total = Math.ceil((seconds * 1000 - now) / 60000);
+  const hours = Math.floor(total / 60);
+  const relative = hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : hours ? `${hours}h ${total % 60}m` : `${total}m`;
+  return `resets in ${relative}, ${exactReset(seconds, now)}`;
+}
+function creditsText(credits) { return credits?.unlimited ? "Unlimited" : numberText(credits?.balance); }
 
-	const body = new URLSearchParams({
-		grant_type: "refresh_token",
-		refresh_token: refreshToken,
-		client_id: clientId,
-	});
+function titleLines(usage, config, mode = "reset") {
+  const bucket = selectBucket(usage, config.bucketId);
+  if (!bucket) return [{ text: "Limit ?", color: COLORS.unknown }, { text: "see menu", color: COLORS.unknown }];
+  const zero = bucket.windows.filter(window => window.remainingPct === 0);
+  if (zero.length) {
+    // All exhausted windows must reset before the allowance is usable again.
+    const latest = zero.reduce((a, b) => (a.resetsAt || Infinity) > (b.resetsAt || Infinity) ? a : b);
+    return [{ text: `${latest.label}  0%`, color: color(0) }, {
+      text: mode === "credits" ? `${creditsText(bucket.credits)} cr` : exactReset(latest.resetsAt), color: config.light ? LIGHT_NEUTRAL : "#E8E8E8",
+    }];
+  }
+  if (bucket.blocked || bucket.reached) return [{ text: "Limited", color: color(0) }, { text: "see menu", color: COLORS.unknown }];
+  const lines = bucket.windows.slice(0, 2).map(window => ({ text: `${window.label}  ${pct(window.remainingPct)}`, color: color(window.remainingPct) }));
+  if (lines.length === 1) lines.push({ text: exactReset(bucket.windows[0].resetsAt), color: config.light ? LIGHT_NEUTRAL : "#E8E8E8" });
+  if (!lines.length) lines.push({ text: "Usage ?", color: COLORS.unknown }, { text: "see menu", color: COLORS.unknown });
+  return lines;
+}
+function titleSvg(usage, config, { stale = false, mode = "reset" } = {}) {
+  const lines = titleLines(usage, config, mode);
+  const width = Math.max(70, Math.min(175, 18 + Math.max(...lines.map(line => line.text.length)) * 6));
+  const accent = stale ? COLORS.stale : config.light ? LIGHT_NEUTRAL : "#E8E8E8";
+  const label = escape(config.titleLabel).slice(0, 5).toUpperCase();
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="24" viewBox="0 0 ${width} 24">
+<style>text { font-family: -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; font-weight: 600; }</style>
+<text x="-22" y="8" transform="rotate(-90)" font-size="6" letter-spacing="0.4" fill="${accent}">${xml(label)}</text>
+<line x1="10" y1="2" x2="10" y2="22" stroke="${accent}" stroke-opacity="0.35"/>
+${lines.map((line, index) => `<text x="14" y="${index ? 21 : 9}" font-size="10" fill="${stale ? COLORS.stale : config.light ? (LIGHT_COLORS[line.color] || line.color) : line.color}">${xml(line.text)}</text>`).join("\n")}
+</svg>`;
+}
+function action(config, label, command) { return `${label} | bash=${attr(config.wrapper)} param1=${command} terminal=false refresh=true`; }
 
-	const refreshed = await requestJson(refreshEndpoint, {
-		method: "POST",
-		headers: { "content-type": "application/x-www-form-urlencoded" },
-		body,
-	});
-
-	return refreshed && (refreshed.access_token || refreshed.accessToken || "");
+function renderMenu(usage, config, options = {}) {
+  const mode = options.mode || titleMode(config);
+  const lines = [];
+  if (usage) {
+    const image = Buffer.from(titleSvg(usage, config, { ...options, mode })).toString("base64");
+    lines.push(`| image=${image} tooltip=${attr(`Codex usage${options.stale ? " — STALE" : ""}`)}`, "---", "Codex usage — remaining allowance | size=13", "---");
+    if (options.stale) lines.push("STALE — showing the last successful reading | color=orange");
+    const selected = selectBucket(usage, config.bucketId);
+    if (!selected) lines.push(`Selected limit unavailable: ${escape(config.bucketId)} | color=orange`);
+    const buckets = [...usage.buckets].sort((a, b) => Number(b === selected) - Number(a === selected));
+    for (const bucket of buckets) {
+      lines.push(`${escape(bucket.name)}${bucket === selected ? " (menu bar)" : ""} | size=13`);
+      if (!bucket.windows.length) lines.push("No quota windows reported");
+      for (const window of bucket.windows) lines.push(`${escape(window.label)}: ${pct(window.remainingPct)} left, ${resetSummary(window.resetsAt)}`);
+      if (bucket.credits) lines.push(`Credits: ${creditsText(bucket.credits)}`);
+      if (bucket.individualLimit) lines.push(`Individual spending allowance: ${pct(bucket.individualLimit.remainingPct)} left, ${resetSummary(bucket.individualLimit.resetsAt)}`);
+      if (bucket.reached || bucket.blocked) lines.push(`Limit state: ${escape(bucket.reached || "limit reached")} | color=orange`);
+      if (bucket.plan) lines.push(`Plan: ${escape(bucket.plan)}`);
+      lines.push("---");
+    }
+    if (usage.availableResets !== null) lines.push(`Available limit resets: ${numberText(usage.availableResets)}`);
+    if (usage.activity) lines.push(`Lifetime tokens: ${numberText(usage.activity.lifetimeTokens)}`, `Peak daily tokens: ${numberText(usage.activity.peakDailyTokens)}`, `Current streak: ${numberText(usage.activity.currentStreakDays)} days`);
+    if (usage.activityUnavailable) lines.push("Token activity unavailable in this CLI/account | color=gray");
+    lines.push(`Last updated: ${clock(usage.fetchedAt)}${options.stale ? ` (${new Date(usage.fetchedAt).toLocaleDateString()})` : ""}`);
+  } else lines.push("○ Codex ? | color=gray", "---", "Codex usage unavailable | color=red");
+  if (options.error) lines.push(`Last error: ${escape(options.error)} | color=red`);
+  if (options.warning) lines.push(`${escape(options.warning)} | color=orange`);
+  lines.push("---", `Zero-limit title shows: ${mode === "credits" ? "credits left" : "reset time"} | color=gray`,
+    action(config, `Switch zero-limit title to: ${mode === "credits" ? "reset time" : "credits left"}`, "toggle-zero-title-mode"),
+    "---", `Open usage page | href=${USAGE_URL}`, action(config, "Refresh now", "refresh"), "---",
+    `Source: ${escape(usage?.source || config.source)} | color=gray`, `Cache TTL: ${config.cacheTtlSeconds}s | color=gray`,
+    `Plugin: ${VERSION} | color=gray`, `Node: ${process.version} | color=gray`);
+  return lines.join("\n") + "\n";
 }
 
-function normalizeUsage(raw) {
-	const limits =
-		raw &&
-		(raw.rateLimits || raw.rate_limits || raw.rate_limit || raw.limits || raw);
-	const primary =
-		limits.primary ||
-		limits.primary_window ||
-		limits.primaryWindow ||
-		limits.session ||
-		limits.five_hour ||
-		limits.fiveHour ||
-		null;
-	const secondary =
-		limits.secondary ||
-		limits.secondary_window ||
-		limits.secondaryWindow ||
-		limits.weekly ||
-		limits.week ||
-		limits.seven_day ||
-		limits.sevenDay ||
-		null;
-
-	const primaryUsed =
-		primary &&
-		(primary.usedPercent ?? primary.used_percent ?? primary.percent_used);
-	const secondaryUsed =
-		secondary &&
-		(secondary.usedPercent ?? secondary.used_percent ?? secondary.percent_used);
-	const additionalTokens = pickNumber(raw, [
-		["credits", "balance"],
-		["additional_tokens"],
-		["additionalTokens"],
-		["additional_rate_limits", "tokens"],
-		["additional_rate_limits", "token_balance"],
-		["additional_rate_limits", "remaining_tokens"],
-		["additional_rate_limits", "remainingTokens"],
-	]);
-
-	const fiveHourRemainingPct =
-		primary &&
-		(primary.remainingPercent ?? primary.remaining_percent) !== undefined
-			? clampPercent(
-					Number(primary.remainingPercent ?? primary.remaining_percent),
-				)
-			: usedToRemaining(primaryUsed);
-
-	const weeklyRemainingPct =
-		secondary &&
-		(secondary.remainingPercent ?? secondary.remaining_percent) !== undefined
-			? clampPercent(
-					Number(secondary.remainingPercent ?? secondary.remaining_percent),
-				)
-			: usedToRemaining(secondaryUsed);
-
-	const safeRaw = raw
-		? {
-				plan_type: raw.plan_type,
-				rate_limit: raw.rate_limit,
-				rateLimits: raw.rateLimits,
-				rate_limits: raw.rate_limits,
-				additional_rate_limits: raw.additional_rate_limits,
-				code_review_rate_limit: raw.code_review_rate_limit,
-				credits: raw.credits,
-				rate_limit_reached_type: raw.rate_limit_reached_type,
-			}
-		: {};
-
-	return {
-		fetchedAt: nowIso(),
-		plan:
-			raw.plan ||
-			raw.planType ||
-			raw.plan_type ||
-			raw.account?.planType ||
-			null,
-		model: raw.model || raw.current_model || raw.defaultModel || null,
-		fiveHourRemainingPct,
-		weeklyRemainingPct,
-		additionalTokens,
-		primaryWindowMins:
-			primary &&
-			(primary.windowDurationMins ??
-				primary.window_duration_mins ??
-				primary.window_minutes ??
-				(primary.limit_window_seconds
-					? Math.round(primary.limit_window_seconds / 60)
-					: undefined)),
-		secondaryWindowMins:
-			secondary &&
-			(secondary.windowDurationMins ??
-				secondary.window_duration_mins ??
-				secondary.window_minutes ??
-				(secondary.limit_window_seconds
-					? Math.round(secondary.limit_window_seconds / 60)
-					: undefined)),
-		primaryResetsAt:
-			primary && (primary.resetsAt ?? primary.resets_at ?? primary.reset_at),
-		secondaryResetsAt:
-			secondary &&
-			(secondary.resetsAt ?? secondary.resets_at ?? secondary.reset_at),
-		reached:
-			limits.rateLimitReachedType || limits.rate_limit_reached_type || null,
-		raw: safeRaw,
-	};
+async function main(args = process.argv.slice(2), env = process.env) {
+  const config = configFromEnv(env);
+  const cached = readCache(config, cacheKey(config));
+  if (args[0] === "toggle-zero-title-mode") {
+    try { writeJson(config.titleModeFile, { mode: titleMode(config) === "reset" ? "credits" : "reset" }); }
+    catch { console.log(renderMenu(cached, config, { warning: "Could not save title preference" })); }
+    return;
+  }
+  const force = args[0] === "refresh" || [env.SWIFTBAR_REFRESH, env.BITBAR_REFRESH].some(value => value === "1" || value === "true");
+  if (isFresh(cached, config, force)) return process.stdout.write(renderMenu(cached, config));
+  let usage;
+  try { usage = await fetchFresh(config); }
+  catch (error) { return process.stdout.write(renderMenu(cached, config, { stale: Boolean(cached), error: error.message })); }
+  let warning;
+  try { writeJson(config.cacheFile, { version: CACHE_VERSION, key: cacheKey(config), usage }); }
+  catch { warning = "Live usage loaded; could not save cache"; }
+  process.stdout.write(renderMenu(usage, config, { warning }));
 }
 
-async function fetchViaAuthJson() {
-	const authFile = findAuthFile();
-	if (!authFile) {
-		throw new Error(
-			`No auth file found. Checked: ${authCandidates().join(", ")}`,
-		);
-	}
+if (require.main === module) main().catch(() => {
+  process.stdout.write("○ Codex ? | color=gray\n---\nCould not load usage; check plugin configuration | color=red\n");
+  process.exitCode = 1;
+});
 
-	const auth = readJson(authFile);
-	let { accessToken, refreshToken, accountId } = extractTokens(auth);
-	if (!accessToken) throw new Error(`No access token found in ${authFile}`);
-
-	if (tokenExpiresSoon(accessToken) && refreshToken) {
-		const refreshed = await refreshAccessToken(refreshToken);
-		if (refreshed) {
-			accessToken = refreshed;
-		}
-	}
-
-	for (let attempt = 0; attempt < 2; attempt += 1) {
-		const headers = {
-			authorization: `Bearer ${accessToken}`,
-			accept: "application/json",
-			"user-agent":
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 14.0; rv:128.0) Gecko/20100101 Firefox/128.0",
-		};
-		if (accountId) headers["chatgpt-account-id"] = accountId;
-
-		try {
-			return normalizeUsage(
-				await requestJson(config.endpoint, { method: "GET", headers }),
-			);
-		} catch (error) {
-			if (
-				!refreshToken ||
-				attempt > 0 ||
-				!/^HTTP (401|403)\b/.test(error.message || "")
-			) {
-				throw error;
-			}
-			const refreshed = await refreshAccessToken(refreshToken);
-			if (!refreshed) throw error;
-			accessToken = refreshed;
-		}
-	}
-
-	throw new Error("Failed to fetch usage");
-}
-
-function fetchViaCodexCli() {
-	const command = process.env.CODEX_CLI_COMMAND || "codex";
-	const args = (process.env.CODEX_CLI_USAGE_ARGS || "usage --json")
-		.split(/\s+/)
-		.filter(Boolean);
-	const result = spawnSync(command, args, {
-		encoding: "utf8",
-		timeout: config.timeoutMs,
-		env: process.env,
-	});
-
-	if (result.error) throw result.error;
-	if (result.status !== 0) {
-		throw new Error(
-			(
-				result.stderr ||
-				result.stdout ||
-				`codex exited ${result.status}`
-			).trim(),
-		);
-	}
-
-	return normalizeUsage(JSON.parse(result.stdout));
-}
-
-async function fetchFresh() {
-	if (config.source === "codex-cli") return fetchViaCodexCli();
-	if (config.source !== "auth-json") {
-		throw new Error(`Unsupported CODEX_USAGE_SOURCE=${config.source}`);
-	}
-	return fetchViaAuthJson();
-}
-
-function swiftbarEscape(value) {
-	return String(value).replace(/\s+/g, " ").replace(/\|/g, "/").slice(0, 240);
-}
-
-function swiftbarAttr(value) {
-	return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\|/g, "/")}"`;
-}
-
-function xmlEscape(value) {
-	return String(value)
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;");
-}
-
-function svgData(svg) {
-	return Buffer.from(svg, "utf8").toString("base64");
-}
-
-function zeroLimitTitleLines(usage, titleMode) {
-	const candidates = [
-		{
-			label: "5h",
-			value: usage.fiveHourRemainingPct,
-			resetsAt: usage.primaryResetsAt,
-		},
-		{
-			label: "1w",
-			value: usage.weeklyRemainingPct,
-			resetsAt: usage.secondaryResetsAt,
-		},
-	].filter((entry) => entry.value === 0);
-
-	if (candidates.length === 0) return null;
-	candidates.sort((a, b) => {
-		const aReset = Number(a.resetsAt) || Number.POSITIVE_INFINITY;
-		const bReset = Number(b.resetsAt) || Number.POSITIVE_INFINITY;
-		return aReset - bReset;
-	});
-
-	const zero = candidates[0];
-	return {
-		line1: `${zero.label}  0%`,
-		line2:
-			titleMode === "tokens"
-				? `${numberText(usage.additionalTokens)} tok`
-				: resetExactText(zero.resetsAt, { compact: true }) || "reset ?",
-		lineColor1: colorForPct(0),
-		lineColor2: USAGE_COLOR.softWhite,
-	};
-}
-
-function usageTitleSvg(usage, stale, titleMode) {
-	const five = usage.fiveHourRemainingPct;
-	const week = usage.weeklyRemainingPct;
-	const label = config.titleLabel.slice(0, 5).toUpperCase();
-	const titleLines = zeroLimitTitleLines(usage, titleMode) || {
-		line1: `5h  ${pctText(five)}`,
-		line2: `1w  ${pctText(week)}`,
-		lineColor1: colorForPct(five),
-		lineColor2: colorForPct(week),
-	};
-	const accentColor = stale ? USAGE_COLOR.staleGray : USAGE_COLOR.softWhite;
-	const lineColor1 = stale ? USAGE_COLOR.staleGray : titleLines.lineColor1;
-	const lineColor2 = stale ? USAGE_COLOR.staleGray : titleLines.lineColor2;
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="62" height="24" viewBox="0 0 62 24">
-		<style>
-		text { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Helvetica, Arial, sans-serif; font-weight: 600; }
-		</style>
-		<text x="-22" y="8" transform="rotate(-90)" font-size="6" letter-spacing="0.4" fill="${xmlEscape(accentColor)}">${xmlEscape(label)}</text>
-		<line x1="10" y1="2" x2="10" y2="22" stroke="${xmlEscape(accentColor)}" stroke-opacity="0.35" stroke-width="1"/>
-		<text x="14" y="9" font-size="10" fill="${xmlEscape(lineColor1)}">${xmlEscape(titleLines.line1)}</text>
-		<text x="14" y="21" font-size="10" fill="${xmlEscape(lineColor2)}">${xmlEscape(titleLines.line2)}</text>
-		</svg>`;
-	return svgData(svg);
-}
-
-function printTitle(usage, stale, titleMode) {
-	const five = usage.fiveHourRemainingPct;
-	const week = usage.weeklyRemainingPct;
-	const titleColor = titleColorFor(five, week, stale);
-	console.log(
-		`| image=${usageTitleSvg(usage, stale, titleMode)} color=${titleColor}`,
-	);
-}
-
-function titleModeLabel(mode) {
-	return mode === "tokens" ? "additional tokens left" : "reset time";
-}
-
-function titleModeToggleLabel(mode) {
-	const next = mode === "tokens" ? "reset time" : "additional tokens left";
-	return `Switch zero-limit title to: ${next}`;
-}
-
-function commandScriptPath() {
-	if (process.env.CODEX_USAGE_PLUGIN_WRAPPER)
-		return process.env.CODEX_USAGE_PLUGIN_WRAPPER;
-	return path.join(
-		path.dirname(path.dirname(process.argv[1] || "")),
-		"codex-usage.1m.sh",
-	);
-}
-
-function printMenu(usage, options = {}) {
-	const titleMode = readZeroLimitTitleMode();
-	const five = usage.fiveHourRemainingPct;
-	const week = usage.weeklyRemainingPct;
-	printTitle(usage, options.stale, titleMode);
-	console.log("---");
-	console.log("Codex usage | size=13");
-	console.log("---");
-	console.log(
-		`5h window: ${pctText(five)} left${usage.primaryResetsAt ? `, ${resetSummaryText(usage.primaryResetsAt)}` : ""}`,
-	);
-	console.log(
-		`Weekly: ${pctText(week)} left${usage.secondaryResetsAt ? `, ${resetSummaryText(usage.secondaryResetsAt)}` : ""}`,
-	);
-	console.log(`Additional tokens: ${numberText(usage.additionalTokens)}`);
-	if (usage.plan) console.log(`Plan: ${swiftbarEscape(usage.plan)}`);
-	if (usage.model) console.log(`Model: ${swiftbarEscape(usage.model)}`);
-	if (usage.reached)
-		console.log(`Limit state: ${swiftbarEscape(usage.reached)}`);
-	console.log(`Last updated: ${formatClock(usage.fetchedAt)}`);
-	if (options.error)
-		console.log(`Last error: ${swiftbarEscape(options.error)} | color=red`);
-	console.log("---");
-	console.log(
-		`Zero-limit title shows: ${titleModeLabel(titleMode)} | color=gray`,
-	);
-	console.log(
-		`${titleModeToggleLabel(titleMode)} | bash=${swiftbarAttr(commandScriptPath())} param1=toggle-zero-title-mode terminal=false refresh=true`,
-	);
-	console.log("---");
-	console.log(
-		"Open usage page | href=https://chatgpt.com/codex/settings/usage",
-	);
-	console.log("Refresh | refresh=true");
-	console.log("---");
-	console.log(`Source: ${swiftbarEscape(config.source)} | color=gray`);
-	console.log(`Cache TTL: ${config.cacheTtlSeconds}s | color=gray`);
-	if (process.env.CODEX_USAGE_NODE_VERSION) {
-		console.log(
-			`Node: ${swiftbarEscape(process.env.CODEX_USAGE_NODE_VERSION)} | color=gray`,
-		);
-	}
-	if (process.env.CODEX_USAGE_NODE) {
-		console.log(
-			`Node path: ${swiftbarEscape(process.env.CODEX_USAGE_NODE)} | color=gray`,
-		);
-	}
-}
-
-function printError(message, cached) {
-	if (cached) return printMenu(cached, { stale: true, error: message });
-	console.log("○ Codex ? | color=gray");
-	console.log("---");
-	console.log("Codex usage unavailable | color=red");
-	console.log(`Error: ${swiftbarEscape(message)} | color=red`);
-	console.log("---");
-	console.log(
-		"Open usage page | href=https://chatgpt.com/codex/settings/usage",
-	);
-	console.log("Refresh | refresh=true");
-	console.log("---");
-	console.log(
-		`Auth files checked: ${swiftbarEscape(authCandidates().join(", "))} | color=gray`,
-	);
-}
-
-async function main() {
-	if (process.argv[2] === "toggle-zero-title-mode") {
-		toggleZeroLimitTitleMode();
-		return;
-	}
-
-	const cached = readCache();
-	if (isFresh(cached)) {
-		printMenu(cached);
-		return;
-	}
-
-	try {
-		const usage = await fetchFresh();
-		writeJson(config.cacheFile, usage);
-		printMenu(usage);
-	} catch (error) {
-		printError(error.message || String(error), cached);
-	}
-}
-
-main();
+module.exports = { configFromEnv, cacheKey, readCache, writeJson, isFresh, titleMode, extractTokens, fetchViaAuthJson, fetchViaAppServer, fetchFresh, titleLines, titleSvg, renderMenu, pct, main, CACHE_VERSION };
